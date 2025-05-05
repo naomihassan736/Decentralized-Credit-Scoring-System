@@ -248,3 +248,98 @@
     )
   )
 )
+
+
+(define-constant dispute-review-period u144)
+(define-constant err-no-active-dispute (err u107))
+(define-constant err-dispute-exists (err u108))
+
+(define-map score-disputes
+  { address: principal }
+  {
+    dispute-id: uint,
+    old-score: uint,
+    reason: (string-ascii 100),
+    timestamp: uint,
+    resolved: bool,
+    resolver: (optional principal)
+  }
+)
+
+(define-data-var dispute-counter uint u0)
+
+(define-public (file-dispute (reason (string-ascii 100)))
+  (let (
+    (current-score (unwrap! (get-credit-score tx-sender) (err err-not-found)))
+    (dispute-id (+ (var-get dispute-counter) u1))
+  )
+    (asserts! (is-none (map-get? score-disputes { address: tx-sender })) (err err-dispute-exists))
+    (map-set score-disputes
+      { address: tx-sender }
+      {
+        dispute-id: dispute-id,
+        old-score: current-score,
+        reason: reason,
+        timestamp: stacks-block-height,
+        resolved: false,
+        resolver: none
+      }
+    )
+    (var-set dispute-counter dispute-id)
+    (ok dispute-id)
+  )
+)
+
+(define-public (resolve-dispute (user principal) (new-score uint))
+  (let ((dispute (unwrap! (map-get? score-disputes { address: user }) (err err-no-active-dispute)))
+  )
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-reporter tx-sender)) (err err-unauthorized))
+    (asserts! (not (get resolved dispute)) (err err-no-active-dispute))
+    (try! (update-credit-score user new-score))
+    (map-set score-disputes
+      { address: user }
+      (merge dispute {
+        resolved: true,
+        resolver: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+
+(define-map improvement-recommendations
+  { score-range: uint }
+  {
+    recommendation: (string-ascii 200),
+    priority: uint
+  }
+)
+
+(define-constant score-ranges (list u300 u500 u700))
+
+(define-public (add-recommendation (score-range uint) (recommendation (string-ascii 200)) (priority uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+    (map-set improvement-recommendations
+      { score-range: score-range }
+      {
+        recommendation: recommendation,
+        priority: priority
+      }
+    )
+    (ok true)
+  )
+)
+
+;; (define-read-only (get-recommendations (address principal))
+;;   (let (
+;;     (current-score (unwrap! (get-credit-score address) (err err-not-found)))
+;;     ;; (applicable-range (fold get-applicable-range score-ranges current-score))
+;;   )
+;;     (match (map-get? improvement-recommendations { score-range: applicable-range })
+;;       recommendation (ok recommendation)
+;;       (err err-not-found)
+;;     )
+;;   )
+;; )
