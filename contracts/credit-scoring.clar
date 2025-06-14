@@ -343,3 +343,142 @@
 ;;     )
 ;;   )
 ;; )
+
+
+(define-constant err-invalid-limit (err u109))
+(define-constant max-history-limit u50)
+
+(define-map score-history
+  { address: principal, entry-id: uint }
+  {
+    old-score: uint,
+    new-score: uint,
+    timestamp: uint,
+    changed-by: principal,
+    reason: (string-ascii 50)
+  }
+)
+
+(define-map user-history-counters
+  { address: principal }
+  { count: uint }
+)
+
+(define-private (get-history-count (address principal))
+  (default-to u0 (get count (map-get? user-history-counters { address: address })))
+)
+
+(define-private (increment-history-count (address principal))
+  (let ((current-count (get-history-count address)))
+    (map-set user-history-counters
+      { address: address }
+      { count: (+ current-count u1) }
+    )
+    (+ current-count u1)
+  )
+)
+
+(define-private (record-score-change (address principal) (old-score uint) (new-score uint) (reason (string-ascii 50)))
+  (let ((entry-id (increment-history-count address)))
+    (map-set score-history
+      { address: address, entry-id: entry-id }
+      {
+        old-score: old-score,
+        new-score: new-score,
+        timestamp: stacks-block-height,
+        changed-by: tx-sender,
+        reason: reason
+      }
+    )
+    entry-id
+  )
+)
+
+(define-public (update-credit-score-with-reason (address principal) (new-score uint) (reason (string-ascii 50)))
+  (if (or (is-eq tx-sender contract-owner) (is-authorized-reporter tx-sender))
+    (if (and (>= new-score min-score) (<= new-score max-score))
+      (match (map-get? user-scores { address: address })
+        score-data 
+        (let ((old-score (get score score-data)))
+          (map-set user-scores
+            { address: address }
+            (merge score-data { 
+              score: new-score,
+              last-updated: stacks-block-height
+            })
+          )
+          (record-score-change address old-score new-score reason)
+          (ok new-score)
+        )
+        (err err-not-found)
+      )
+      (err err-invalid-score)
+    )
+    (err err-unauthorized)
+  )
+)
+
+(define-read-only (get-score-history-entry (address principal) (entry-id uint))
+  (match (map-get? score-history { address: address, entry-id: entry-id })
+    history-entry (ok history-entry)
+    (err err-not-found)
+  )
+)
+
+
+
+(define-read-only (get-score-trend (address principal) (periods uint))
+  (if (and (> periods u0) (<= periods u10))
+    (let (
+      (current-score (unwrap! (get-credit-score address) (err err-not-found)))
+      (total-count (get-history-count address))
+    )
+      (if (>= total-count periods)
+        (let ((old-entry (map-get? score-history { address: address, entry-id: (- total-count periods) })))
+          (match old-entry
+            entry (ok {
+              current-score: current-score,
+              previous-score: (get old-score entry),
+              change: (if (>= current-score (get old-score entry)) 
+                       (- current-score (get old-score entry))
+                       (- (get old-score entry) current-score)),
+              trend: (if (> current-score (get old-score entry)) "up" 
+                     (if (< current-score (get old-score entry)) "down" "stable"))
+            })
+            (ok {
+              current-score: current-score,
+              previous-score: current-score,
+              change: u0,
+              trend: "stable"
+            })
+          )
+        )
+        (ok {
+          current-score: current-score,
+          previous-score: current-score,
+          change: u0,
+          trend: "insufficient-data"
+        })
+      )
+    )
+    (err err-invalid-limit)
+  )
+)
+
+(define-read-only (get-user-history-stats (address principal))
+  (let (
+    (total-entries (get-history-count address))
+    (current-score (unwrap! (get-credit-score address) (err err-not-found)))
+  )
+    (ok {
+      total-score-changes: total-entries,
+      current-score: current-score,
+      first-recorded: (if (> total-entries u0) 
+                       (get timestamp (unwrap-panic (map-get? score-history { address: address, entry-id: u1 })))
+                       u0),
+      last-updated: (if (> total-entries u0)
+                     (get timestamp (unwrap-panic (map-get? score-history { address: address, entry-id: total-entries })))
+                     u0)
+    })
+  )
+)
