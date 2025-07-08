@@ -17,6 +17,80 @@
 (define-data-var total-users uint u0)
 (define-data-var paused bool false)
 
+
+(define-constant err-insufficient-stake (err u110))
+(define-constant err-verification-exists (err u111))
+(define-constant err-not-in-verification (err u112))
+(define-constant err-verification-expired (err u113))
+(define-constant err-invalid-verification (err u114))
+(define-constant err-already-verified (err u115))
+(define-constant err-insufficient-balance (err u116))
+
+(define-constant min-stake-amount u1000)
+(define-constant verification-period u144)
+(define-constant challenge-period u72)
+(define-constant reward-percentage u20)
+(define-constant slash-percentage u50)
+
+(define-data-var verification-counter uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var reward-pool uint u0)
+
+(define-map verification-requests
+  { verification-id: uint }
+  {
+    reporter: principal,
+    target-address: principal,
+    proposed-score: uint,
+    stake-amount: uint,
+    timestamp: uint,
+    status: (string-ascii 20),
+    validators: (list 10 principal),
+    support-votes: uint,
+    challenge-votes: uint,
+    final-score: (optional uint)
+  }
+)
+
+(define-map reporter-stakes
+  { reporter: principal }
+  {
+    total-staked: uint,
+    active-verifications: uint,
+    reputation-score: uint,
+    slash-count: uint
+  }
+)
+
+(define-map validator-participations
+  { validator: principal, verification-id: uint }
+  {
+    vote: (string-ascii 10),
+    timestamp: uint,
+    stake-amount: uint
+  }
+)
+
+(define-map verification-challenges
+  { verification-id: uint, challenger: principal }
+  {
+    challenge-reason: (string-ascii 200),
+    evidence-hash: (string-ascii 64),
+    timestamp: uint,
+    resolved: bool
+  }
+)
+
+(define-map validator-rewards
+  { validator: principal }
+  {
+    total-earned: uint,
+    successful-validations: uint,
+    failed-validations: uint,
+    reputation: uint
+  }
+)
+
 (define-map user-scores
   { address: principal }
   {
@@ -480,5 +554,293 @@
                      (get timestamp (unwrap-panic (map-get? score-history { address: address, entry-id: total-entries })))
                      u0)
     })
+  )
+)
+
+
+(define-read-only (get-verification-request (verification-id uint))
+  (match (map-get? verification-requests { verification-id: verification-id })
+    verification (ok verification)
+    (err err-not-found)
+  )
+)
+
+(define-read-only (get-reporter-stake (reporter principal))
+  (default-to 
+    { total-staked: u0, active-verifications: u0, reputation-score: u100, slash-count: u0 }
+    (map-get? reporter-stakes { reporter: reporter })
+  )
+)
+
+(define-read-only (get-validator-participation (validator principal) (verification-id uint))
+  (match (map-get? validator-participations { validator: validator, verification-id: verification-id })
+    participation (ok participation)
+    (err err-not-found)
+  )
+)
+
+(define-read-only (get-verification-challenge (verification-id uint) (challenger principal))
+  (match (map-get? verification-challenges { verification-id: verification-id, challenger: challenger })
+    challenge (ok challenge)
+    (err err-not-found)
+  )
+)
+
+(define-read-only (get-validator-rewards (validator principal))
+  (default-to 
+    { total-earned: u0, successful-validations: u0, failed-validations: u0, reputation: u100 }
+    (map-get? validator-rewards { validator: validator })
+  )
+)
+
+(define-read-only (get-staking-stats)
+  (ok {
+    total-staked: (var-get total-staked),
+    reward-pool: (var-get reward-pool),
+    active-verifications: (var-get verification-counter)
+  })
+)
+
+(define-public (stake-for-verification (target-address principal) (proposed-score uint) (stake-amount uint))
+  (let (
+    (verification-id (+ (var-get verification-counter) u1))
+    (reporter-data (get-reporter-stake tx-sender))
+  )
+    (asserts! (>= stake-amount min-stake-amount) (err err-insufficient-stake))
+    (asserts! (and (>= proposed-score min-score) (<= proposed-score max-score)) (err err-invalid-score))
+    (asserts! (is-none (map-get? verification-requests { verification-id: verification-id })) (err err-verification-exists))
+    
+    (map-set verification-requests
+      { verification-id: verification-id }
+      {
+        reporter: tx-sender,
+        target-address: target-address,
+        proposed-score: proposed-score,
+        stake-amount: stake-amount,
+        timestamp: stacks-block-height,
+        status: "pending",
+        validators: (list),
+        support-votes: u0,
+        challenge-votes: u0,
+        final-score: none
+      }
+    )
+    
+    (map-set reporter-stakes
+      { reporter: tx-sender }
+      {
+        total-staked: (+ (get total-staked reporter-data) stake-amount),
+        active-verifications: (+ (get active-verifications reporter-data) u1),
+        reputation-score: (get reputation-score reporter-data),
+        slash-count: (get slash-count reporter-data)
+      }
+    )
+    
+    (var-set verification-counter verification-id)
+    (var-set total-staked (+ (var-get total-staked) stake-amount))
+    (ok verification-id)
+  )
+)
+
+(define-public (participate-in-verification (verification-id uint) (vote (string-ascii 10)) (validator-stake uint))
+  (let (
+    (verification (unwrap! (map-get? verification-requests { verification-id: verification-id }) (err err-not-found)))
+    (current-validators (get validators verification))
+  )
+    (asserts! (>= validator-stake min-stake-amount) (err err-insufficient-stake))
+    (asserts! (is-eq (get status verification) "pending") (err err-not-in-verification))
+    (asserts! (< (+ (get timestamp verification) verification-period) stacks-block-height) (err err-verification-expired))
+    (asserts! (is-none (map-get? validator-participations { validator: tx-sender, verification-id: verification-id })) (err err-already-verified))
+    
+    (map-set validator-participations
+      { validator: tx-sender, verification-id: verification-id }
+      {
+        vote: vote,
+        timestamp: stacks-block-height,
+        stake-amount: validator-stake
+      }
+    )
+    
+    (if (is-eq vote "support")
+      (map-set verification-requests
+        { verification-id: verification-id }
+        (merge verification { 
+          support-votes: (+ (get support-votes verification) u1),
+          validators: (unwrap-panic (as-max-len? (append current-validators tx-sender) u10))
+        })
+      )
+      (map-set verification-requests
+        { verification-id: verification-id }
+        (merge verification { 
+          challenge-votes: (+ (get challenge-votes verification) u1),
+          validators: (unwrap-panic (as-max-len? (append current-validators tx-sender) u10))
+        })
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (challenge-verification (verification-id uint) (reason (string-ascii 200)) (evidence-hash (string-ascii 64)))
+  (let (
+    (verification (unwrap! (map-get? verification-requests { verification-id: verification-id }) (err err-not-found)))
+  )
+    (asserts! (is-eq (get status verification) "pending") (err err-not-in-verification))
+    (asserts! (< (+ (get timestamp verification) challenge-period) stacks-block-height) (err err-verification-expired))
+    (asserts! (is-none (map-get? verification-challenges { verification-id: verification-id, challenger: tx-sender })) (err err-already-verified))
+    
+    (map-set verification-challenges
+      { verification-id: verification-id, challenger: tx-sender }
+      {
+        challenge-reason: reason,
+        evidence-hash: evidence-hash,
+        timestamp: stacks-block-height,
+        resolved: false
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-verification (verification-id uint))
+  (let (
+    (verification (unwrap! (map-get? verification-requests { verification-id: verification-id }) (err err-not-found)))
+    (support-votes (get support-votes verification))
+    (challenge-votes (get challenge-votes verification))
+    (reporter (get reporter verification))
+    (target-address (get target-address verification))
+    (proposed-score (get proposed-score verification))
+    (stake-amount (get stake-amount verification))
+    (reporter-data (get-reporter-stake reporter))
+  )
+    (asserts! (is-eq (get status verification) "pending") (err err-invalid-verification))
+    (asserts! (>= (+ (get timestamp verification) verification-period) stacks-block-height) (err err-verification-expired))
+    
+    (if (> support-votes challenge-votes)
+      (begin
+        (try! (update-credit-score target-address proposed-score))
+        (map-set verification-requests
+          { verification-id: verification-id }
+          (merge verification { 
+            status: "approved",
+            final-score: (some proposed-score)
+          })
+        )
+        (map-set reporter-stakes
+          { reporter: reporter }
+          (merge reporter-data {
+            reputation-score: (+ (get reputation-score reporter-data) u10),
+            active-verifications: (- (get active-verifications reporter-data) u1)
+          })
+        )
+        (var-set reward-pool (+ (var-get reward-pool) (/ (* stake-amount reward-percentage) u100)))
+        (ok "approved")
+      )
+      (begin
+        (map-set verification-requests
+          { verification-id: verification-id }
+          (merge verification { 
+            status: "rejected",
+            final-score: none
+          })
+        )
+        (let ((slash-amount (/ (* stake-amount slash-percentage) u100)))
+          (map-set reporter-stakes
+            { reporter: reporter }
+            (merge reporter-data {
+              total-staked: (- (get total-staked reporter-data) slash-amount),
+              reputation-score: (if (>= (get reputation-score reporter-data) u20) 
+                                 (- (get reputation-score reporter-data) u20) 
+                                 u0),
+              slash-count: (+ (get slash-count reporter-data) u1),
+              active-verifications: (- (get active-verifications reporter-data) u1)
+            })
+          )
+          (var-set total-staked (- (var-get total-staked) slash-amount))
+          (var-set reward-pool (+ (var-get reward-pool) slash-amount))
+        )
+        (ok "rejected")
+      )
+    )
+  )
+)
+
+(define-public (distribute-validator-rewards (verification-id uint))
+  (let (
+    (verification (unwrap! (map-get? verification-requests { verification-id: verification-id }) (err err-not-found)))
+    (validators (get validators verification))
+    (is-approved (is-eq (get status verification) "approved"))
+    (total-reward (/ (var-get reward-pool) (len validators)))
+  )
+    (asserts! (not (is-eq (get status verification) "pending")) (err err-not-in-verification))
+    (asserts! (> (len validators) u0) (err err-not-found))
+    
+    (fold distribute-individual-reward validators { reward-amount: total-reward, verification-id: verification-id, approved: is-approved })
+    (var-set reward-pool (- (var-get reward-pool) (* total-reward (len validators))))
+    (ok true)
+  )
+)
+
+(define-private (distribute-individual-reward (validator principal) (context { reward-amount: uint, verification-id: uint, approved: bool }))
+  (let (
+    (participation (map-get? validator-participations { validator: validator, verification-id: (get verification-id context) }))
+    (current-rewards (get-validator-rewards validator))
+    (reward-amount (get reward-amount context))
+    (is-approved (get approved context))
+  )
+    (match participation
+      part-data 
+      (let (
+        (vote (get vote part-data))
+        (correct-vote (or (and is-approved (is-eq vote "support")) (and (not is-approved) (is-eq vote "challenge"))))
+      )
+        (if correct-vote
+          (map-set validator-rewards
+            { validator: validator }
+            {
+              total-earned: (+ (get total-earned current-rewards) reward-amount),
+              successful-validations: (+ (get successful-validations current-rewards) u1),
+              failed-validations: (get failed-validations current-rewards),
+              reputation: (+ (get reputation current-rewards) u5)
+            }
+          )
+          (map-set validator-rewards
+            { validator: validator }
+            {
+              total-earned: (get total-earned current-rewards),
+              successful-validations: (get successful-validations current-rewards),
+              failed-validations: (+ (get failed-validations current-rewards) u1),
+              reputation: (if (>= (get reputation current-rewards) u5) 
+                           (- (get reputation current-rewards) u5) 
+                           u0)
+            }
+          )
+        )
+      )
+      false
+    )
+    context
+  )
+)
+
+(define-public (withdraw-stake (amount uint))
+  (let (
+    (reporter-data (get-reporter-stake tx-sender))
+    (available-stake (- (get total-staked reporter-data) (* (get active-verifications reporter-data) min-stake-amount)))
+  )
+    (asserts! (<= amount available-stake) (err err-insufficient-balance))
+    (asserts! (> amount u0) (err err-invalid-verification))
+    
+    (map-set reporter-stakes
+      { reporter: tx-sender }
+      (merge reporter-data {
+        total-staked: (- (get total-staked reporter-data) amount)
+      })
+    )
+    
+    (var-set total-staked (- (var-get total-staked) amount))
+    (ok amount)
   )
 )
