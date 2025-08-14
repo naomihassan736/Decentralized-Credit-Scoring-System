@@ -844,3 +844,372 @@
     (ok amount)
   )
 )
+
+;; Social Credit Vouching & Endorsement System
+(define-constant err-invalid-voucher (err u117))
+(define-constant err-vouch-exists (err u118))
+(define-constant err-self-vouch (err u119))
+(define-constant err-voucher-limit-exceeded (err u120))
+(define-constant err-insufficient-voucher-score (err u121))
+(define-constant err-vouch-not-found (err u122))
+(define-constant err-vouch-expired (err u123))
+(define-constant err-already-vouched (err u124))
+
+;; Vouching system constants
+(define-constant min-voucher-score u650) ;; Minimum score to be a voucher
+(define-constant max-vouches-per-user u5) ;; Maximum active vouches per voucher
+(define-constant vouch-duration u1008) ;; Vouch active period (about 1 week in blocks)
+(define-constant vouch-reputation-stake u50) ;; Reputation points staked per vouch
+(define-constant score-boost-amount u25) ;; Score boost for vouched users
+(define-constant voucher-reward-amount u10) ;; Reputation reward for successful vouches
+(define-constant voucher-penalty-amount u30) ;; Reputation penalty for failed vouches
+
+;; Vouching system data variables
+(define-data-var vouch-counter uint u0)
+(define-data-var total-active-vouches uint u0)
+
+;; Track individual vouching relationships
+(define-map credit-vouches
+  { vouch-id: uint }
+  {
+    voucher: principal,
+    vouched-user: principal,
+    vouch-amount: uint, ;; Reputation staked
+    start-block: uint,
+    end-block: uint,
+    status: (string-ascii 20), ;; "active", "completed", "defaulted"
+    score-boost-applied: bool,
+    voucher-benefit: uint ;; Benefit voucher has received from this vouch
+  }
+)
+
+;; Track voucher statistics and limits
+(define-map voucher-profiles
+  { voucher: principal }
+  {
+    total-vouches-given: uint,
+    active-vouches: uint,
+    successful-vouches: uint,
+    failed-vouches: uint,
+    reputation-staked: uint,
+    voucher-reputation: uint, ;; Separate vouching reputation
+    total-voucher-rewards: uint
+  }
+)
+
+;; Track users who have been vouched for
+(define-map vouched-users
+  { user: principal }
+  {
+    current-vouchers: (list 5 principal),
+    total-vouches-received: uint,
+    active-vouches: uint,
+    score-boosts-active: uint,
+    vouching-history-count: uint
+  }
+)
+
+;; Track vouching relationships for easy lookup
+(define-map user-vouch-relationships
+  { voucher: principal, vouched-user: principal }
+  { vouch-id: uint, active: bool }
+)
+
+;; Read-only functions for vouching system
+(define-read-only (get-vouch-details (vouch-id uint))
+  (match (map-get? credit-vouches { vouch-id: vouch-id })
+    vouch (ok vouch)
+    (err err-vouch-not-found)
+  )
+)
+
+(define-read-only (get-voucher-profile (voucher principal))
+  (default-to 
+    { 
+      total-vouches-given: u0, 
+      active-vouches: u0, 
+      successful-vouches: u0, 
+      failed-vouches: u0, 
+      reputation-staked: u0, 
+      voucher-reputation: u100,
+      total-voucher-rewards: u0
+    }
+    (map-get? voucher-profiles { voucher: voucher })
+  )
+)
+
+(define-read-only (get-vouched-user-status (user principal))
+  (default-to 
+    { 
+      current-vouchers: (list), 
+      total-vouches-received: u0, 
+      active-vouches: u0, 
+      score-boosts-active: u0,
+      vouching-history-count: u0
+    }
+    (map-get? vouched-users { user: user })
+  )
+)
+
+(define-read-only (get-vouch-relationship (voucher principal) (vouched-user principal))
+  (match (map-get? user-vouch-relationships { voucher: voucher, vouched-user: vouched-user })
+    relationship (ok relationship)
+    (err err-vouch-not-found)
+  )
+)
+
+(define-read-only (is-eligible-voucher (potential-voucher principal))
+  (let (
+    (voucher-score (unwrap! (get-credit-score potential-voucher) (err err-not-found)))
+    (voucher-profile (get-voucher-profile potential-voucher))
+  )
+    (ok {
+      meets-score-requirement: (>= voucher-score min-voucher-score),
+      within-vouch-limit: (< (get active-vouches voucher-profile) max-vouches-per-user),
+      voucher-reputation: (get voucher-reputation voucher-profile)
+    })
+  )
+)
+
+(define-read-only (calculate-vouch-benefit (vouched-user principal))
+  (let (
+    (current-score (unwrap! (get-credit-score vouched-user) (err err-not-found)))
+    (vouched-status (get-vouched-user-status vouched-user))
+    (active-boosts (get score-boosts-active vouched-status))
+  )
+    (ok {
+      base-score: current-score,
+      total-boost: (* active-boosts score-boost-amount),
+      effective-score: (+ current-score (* active-boosts score-boost-amount))
+    })
+  )
+)
+
+;; Create a vouch for another user
+(define-public (vouch-for-user (vouched-user principal) (reputation-stake uint))
+  (let (
+    (vouch-id (+ (var-get vouch-counter) u1))
+    (voucher-score (unwrap! (get-credit-score tx-sender) (err err-invalid-voucher)))
+    (voucher-profile (get-voucher-profile tx-sender))
+    (vouched-status (get-vouched-user-status vouched-user))
+  )
+    ;; Validation checks
+    (asserts! (not (is-eq tx-sender vouched-user)) (err err-self-vouch))
+    (asserts! (>= voucher-score min-voucher-score) (err err-insufficient-voucher-score))
+    (asserts! (< (get active-vouches voucher-profile) max-vouches-per-user) (err err-voucher-limit-exceeded))
+    (asserts! (>= reputation-stake vouch-reputation-stake) (err err-insufficient-stake))
+    (asserts! (is-none (map-get? user-vouch-relationships { voucher: tx-sender, vouched-user: vouched-user })) (err err-already-vouched))
+    
+    ;; Create the vouch record
+    (map-set credit-vouches
+      { vouch-id: vouch-id }
+      {
+        voucher: tx-sender,
+        vouched-user: vouched-user,
+        vouch-amount: reputation-stake,
+        start-block: stacks-block-height,
+        end-block: (+ stacks-block-height vouch-duration),
+        status: "active",
+        score-boost-applied: true,
+        voucher-benefit: u0
+      }
+    )
+    
+    ;; Update voucher profile
+    (map-set voucher-profiles
+      { voucher: tx-sender }
+      {
+        total-vouches-given: (+ (get total-vouches-given voucher-profile) u1),
+        active-vouches: (+ (get active-vouches voucher-profile) u1),
+        successful-vouches: (get successful-vouches voucher-profile),
+        failed-vouches: (get failed-vouches voucher-profile),
+        reputation-staked: (+ (get reputation-staked voucher-profile) reputation-stake),
+        voucher-reputation: (get voucher-reputation voucher-profile),
+        total-voucher-rewards: (get total-voucher-rewards voucher-profile)
+      }
+    )
+    
+    ;; Update vouched user status
+    (map-set vouched-users
+      { user: vouched-user }
+      {
+        current-vouchers: (unwrap-panic (as-max-len? (append (get current-vouchers vouched-status) tx-sender) u5)),
+        total-vouches-received: (+ (get total-vouches-received vouched-status) u1),
+        active-vouches: (+ (get active-vouches vouched-status) u1),
+        score-boosts-active: (+ (get score-boosts-active vouched-status) u1),
+        vouching-history-count: (+ (get vouching-history-count vouched-status) u1)
+      }
+    )
+    
+    ;; Create relationship mapping
+    (map-set user-vouch-relationships
+      { voucher: tx-sender, vouched-user: vouched-user }
+      { vouch-id: vouch-id, active: true }
+    )
+    
+    ;; Update global counters
+    (var-set vouch-counter vouch-id)
+    (var-set total-active-vouches (+ (var-get total-active-vouches) u1))
+    
+    (ok vouch-id)
+  )
+)
+
+;; Complete a successful vouch (called when vouched user performs well)
+(define-public (complete-vouch (vouch-id uint))
+  (let (
+    (vouch (unwrap! (map-get? credit-vouches { vouch-id: vouch-id }) (err err-vouch-not-found)))
+    (voucher (get voucher vouch))
+    (vouched-user (get vouched-user vouch))
+    (voucher-profile (get-voucher-profile voucher))
+    (vouched-status (get-vouched-user-status vouched-user))
+  )
+    ;; Only contract owner or authorized reporters can complete vouches
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-reporter tx-sender)) (err err-unauthorized))
+    (asserts! (is-eq (get status vouch) "active") (err err-invalid-verification))
+    
+    ;; Update vouch status
+    (map-set credit-vouches
+      { vouch-id: vouch-id }
+      (merge vouch { 
+        status: "completed",
+        voucher-benefit: voucher-reward-amount
+      })
+    )
+    
+    ;; Reward the voucher
+    (map-set voucher-profiles
+      { voucher: voucher }
+      (merge voucher-profile {
+        active-vouches: (- (get active-vouches voucher-profile) u1),
+        successful-vouches: (+ (get successful-vouches voucher-profile) u1),
+        reputation-staked: (- (get reputation-staked voucher-profile) (get vouch-amount vouch)),
+        voucher-reputation: (+ (get voucher-reputation voucher-profile) voucher-reward-amount),
+        total-voucher-rewards: (+ (get total-voucher-rewards voucher-profile) voucher-reward-amount)
+      })
+    )
+    
+    ;; Update vouched user (remove boost but keep history)
+    (map-set vouched-users
+      { user: vouched-user }
+      (merge vouched-status {
+        active-vouches: (- (get active-vouches vouched-status) u1),
+        score-boosts-active: (- (get score-boosts-active vouched-status) u1)
+      })
+    )
+    
+    ;; Update relationship
+    (map-set user-vouch-relationships
+      { voucher: voucher, vouched-user: vouched-user }
+      { vouch-id: vouch-id, active: false }
+    )
+    
+    (var-set total-active-vouches (- (var-get total-active-vouches) u1))
+    (ok true)
+  )
+)
+
+;; Penalize voucher for failed vouch (called when vouched user defaults)
+(define-public (penalize-vouch (vouch-id uint))
+  (let (
+    (vouch (unwrap! (map-get? credit-vouches { vouch-id: vouch-id }) (err err-vouch-not-found)))
+    (voucher (get voucher vouch))
+    (vouched-user (get vouched-user vouch))
+    (voucher-profile (get-voucher-profile voucher))
+    (vouched-status (get-vouched-user-status vouched-user))
+  )
+    ;; Only contract owner or authorized reporters can penalize vouches
+    (asserts! (or (is-eq tx-sender contract-owner) (is-authorized-reporter tx-sender)) (err err-unauthorized))
+    (asserts! (is-eq (get status vouch) "active") (err err-invalid-verification))
+    
+    ;; Update vouch status
+    (map-set credit-vouches
+      { vouch-id: vouch-id }
+      (merge vouch { status: "defaulted" })
+    )
+    
+    ;; Penalize the voucher
+    (map-set voucher-profiles
+      { voucher: voucher }
+      (merge voucher-profile {
+        active-vouches: (- (get active-vouches voucher-profile) u1),
+        failed-vouches: (+ (get failed-vouches voucher-profile) u1),
+        reputation-staked: (- (get reputation-staked voucher-profile) (get vouch-amount vouch)),
+        voucher-reputation: (if (>= (get voucher-reputation voucher-profile) voucher-penalty-amount)
+                             (- (get voucher-reputation voucher-profile) voucher-penalty-amount)
+                             u0)
+      })
+    )
+    
+    ;; Update vouched user (remove boost)
+    (map-set vouched-users
+      { user: vouched-user }
+      (merge vouched-status {
+        active-vouches: (- (get active-vouches vouched-status) u1),
+        score-boosts-active: (- (get score-boosts-active vouched-status) u1)
+      })
+    )
+    
+    ;; Update relationship
+    (map-set user-vouch-relationships
+      { voucher: voucher, vouched-user: vouched-user }
+      { vouch-id: vouch-id, active: false }
+    )
+    
+    (var-set total-active-vouches (- (var-get total-active-vouches) u1))
+    (ok true)
+  )
+)
+
+;; Revoke an active vouch (voluntary withdrawal by voucher)
+(define-public (revoke-vouch (vouched-user principal))
+  (let (
+    (relationship (unwrap! (map-get? user-vouch-relationships { voucher: tx-sender, vouched-user: vouched-user }) (err err-vouch-not-found)))
+    (vouch-id (get vouch-id relationship))
+    (vouch (unwrap! (map-get? credit-vouches { vouch-id: vouch-id }) (err err-vouch-not-found)))
+    (voucher-profile (get-voucher-profile tx-sender))
+    (vouched-status (get-vouched-user-status vouched-user))
+  )
+    (asserts! (get active relationship) (err err-vouch-expired))
+    (asserts! (is-eq (get status vouch) "active") (err err-invalid-verification))
+    
+    ;; Update vouch status
+    (map-set credit-vouches
+      { vouch-id: vouch-id }
+      (merge vouch { status: "revoked" })
+    )
+    
+    ;; Update voucher profile (small penalty for revoking)
+    (map-set voucher-profiles
+      { voucher: tx-sender }
+      (merge voucher-profile {
+        active-vouches: (- (get active-vouches voucher-profile) u1),
+        reputation-staked: (- (get reputation-staked voucher-profile) (get vouch-amount vouch)),
+        voucher-reputation: (if (>= (get voucher-reputation voucher-profile) u5)
+                             (- (get voucher-reputation voucher-profile) u5)
+                             u0)
+      })
+    )
+    
+    ;; Update vouched user (remove boost)
+    (map-set vouched-users
+      { user: vouched-user }
+      (merge vouched-status {
+        active-vouches: (- (get active-vouches vouched-status) u1),
+        score-boosts-active: (- (get score-boosts-active vouched-status) u1)
+      })
+    )
+    
+    ;; Update relationship
+    (map-set user-vouch-relationships
+      { voucher: tx-sender, vouched-user: vouched-user }
+      (merge relationship { active: false })
+    )
+    
+    (var-set total-active-vouches (- (var-get total-active-vouches) u1))
+    (ok true)
+  )
+)
+
+
+
