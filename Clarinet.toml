@@ -1,0 +1,27 @@
+[project]
+name = 'credit-scoring'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.credit-scoring]
+path = 'contracts/credit-scoring.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.score-predictor]
+path = 'contracts/score-predictor.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.credit-compliance-monitor]
+path = 'contracts/credit-compliance-monitor.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
