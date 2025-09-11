@@ -9,6 +9,14 @@ requirements = []
 path = 'contracts/credit-scoring.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.score-predictor]
+path = 'contracts/score-predictor.clar'
+clarity_version = 3
+epoch = 3.1
+[contracts.credit-compliance-monitor]
+path = 'contracts/credit-compliance-monitor.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
